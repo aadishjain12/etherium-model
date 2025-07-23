@@ -1,172 +1,122 @@
-import os
-import sys
-import time
 import pandas as pd
+import time
 from datetime import datetime
-from local_utils import prepare_data, extract_features, plot_backtest, generate_signals, simulate_portfolio
-import requests
+from data_fetcher import fetch_ohlcv_binance
+import joblib
+from local_utils import preprocess_live_data, display_output
+import os
 
-# Fetch historical candle data from Binance
-def fetch_binance_candle_data(symbol="ETHUSDT", interval="1h", limit=100):
-    url = f'https://api.binance.com/api/v3/klines'
-    params = {
-        'symbol': symbol,
-        'interval': interval,
-        'limit': limit
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
+wallet_balance = 1000.0  # starting capital
+cash_balance = wallet_balance  # in USD
+eth_balance = 0.0  # in ETH
+current_position = "NONE"
+entry_price = None
 
-    if isinstance(data, dict) and data.get("code"):
-        raise ValueError(f"Binance API error: {data['msg']}")
+# Load trained model
+model = joblib.load("model.pkl")
+print("✅ Model loaded.")
 
-    df = pd.DataFrame(data, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'num_trades',
-        'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
-    ])
+# Set optimized thresholds
+BUY_THRESHOLD = 0.15
+SELL_THRESHOLD = 0.18
 
-    df['date'] = pd.to_datetime(df['open_time'], unit='ms')
-    df['close'] = df['close'].astype(float)
-    return df[['date', 'close']]
+# CSV logging setup
+csv_file = "eth_predictions_log.csv"
+if not os.path.exists(csv_file):
+    with open(csv_file, "w") as f:
+        f.write("timestamp,price,signal,sell_prob,hold_prob,buy_prob,wallet_balance\n")
 
-# Fetch hourly historical ETH prices from CoinMarketCap
-def fetch_coinmarketcap_data(api_key):
-    url = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/historical'
-    symbol = 'ETH'
+print("🔁 Running model every 5 minutes. Press Ctrl+C to stop.\n")
 
-    params = {
-        'symbol': symbol,
-        'interval': 'hourly',
-        'count': 100
-    }
+try:
+    while True:
+        print("🔄 Fetching Live ETH 5m Data...")
+        df = fetch_ohlcv_binance(interval="1h")
 
-    headers = {
-        'Accepts': 'application/json',
-        'X-CMC_PRO_API_KEY': api_key,
-    }
+        if df is not None and not df.empty:
+            print(f"✅ Fetched {len(df)} rows of ETHUSDT 5m data")
 
-    response = requests.get(url, headers=headers, params=params)
-    data = response.json()
+            live_features = preprocess_live_data(df)
+            print("🚨 Checking live input features:")
+            print(live_features.tail(3))
 
-    if 'data' not in data or 'quotes' not in data['data']:
-        raise ValueError("Invalid API response from CoinMarketCap")
+            if live_features is not None and not live_features.empty:
+                latest_row = live_features.iloc[[-1]]
+                proba = model.predict_proba(latest_row)
+                print(f"🔍 Raw probabilities (class order: {model.classes_}): {proba}")
 
-    quotes = data['data']['quotes']
-    df = pd.DataFrame([{
-        'date': q['timestamp'],
-        'close': q['quote']['USD']['price']
-    } for q in quotes])
-    df['date'] = pd.to_datetime(df['date'])
-    df['close'] = df['close'].astype(float)
-    return df[['date', 'close']]
+                prob_array = proba[0]
+                probabilities = dict(zip(model.classes_, prob_array))
 
-# Simulated sentiment generator
-def simulated_sentiment_step(i):
-    cycle = ["Strongly Bullish", "Slightly Bullish", "Neutral", "Slightly Bearish", "Strongly Bearish"]
-    return cycle[i % len(cycle)]
+                buy_prob = probabilities.get('BUY', 0)
+                sell_prob = probabilities.get('SELL', 0)
 
-def simulate_sentiment(i):
-    return simulated_sentiment_step(i)
+                if buy_prob >= BUY_THRESHOLD:
+                    signal = "BUY"
+                elif sell_prob >= SELL_THRESHOLD:
+                    signal = "SELL"
+                else:
+                    signal = "HOLD"
 
-def get_sentiment_summary(features, step=None):
-    sentiment = simulate_sentiment(step or 0)
-    return f"\U0001F4CA Simulated Sentiment: {sentiment}\n→ Suggested action: {'BUY' if 'Bullish' in sentiment else 'SELL' if 'Bearish' in sentiment else 'HOLD'}"
+                latest_price = df['close'].iloc[-1]
+                previous_price = df['close'].iloc[-2]
+                latest_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def run_sentiment_mode():
-    print(f"\n\U0001F4C8 Simulated Market Sentiment for ETH/USDT @ {datetime.now()}")
-    print("→ This model uses historical market indicators to simulate trading signals.")
-    try:
-        df = fetch_coinmarketcap_data(api_key="cf1a3abc-4e7a-4f73-8c57-13fc66fb6a76")
-        df = prepare_data(df)
-        features = extract_features(df)
-        sentiment = get_sentiment_summary(features)
-        print(f"→ {sentiment}")
-    except Exception as e:
-        print(f"❌ Failed to generate sentiment: {e}")
+                # --- Wallet Simulation Logic ---
+                if signal == "BUY":
+                    if current_position != "LONG":
+                        # Close short if any
+                        if current_position == "SHORT":
+                            cash_balance += abs(eth_balance) * latest_price
+                            eth_balance = 0.0
 
-def simulate_portfolio(df):
-    cash = 1000.0
-    eth = 0.0
-    portfolio_values = []
+                        # Enter LONG
+                        eth_balance = cash_balance / latest_price
+                        cash_balance = 0.0
+                        current_position = "LONG"
 
-    print("\U0001F4CA Columns in DataFrame before simulation:", df.columns.tolist())
+                elif signal == "SELL":
+                    if current_position != "SHORT":
+                        # Close long if any
+                        if current_position == "LONG":
+                            cash_balance += eth_balance * latest_price
+                            eth_balance = 0.0
 
-    if 'close' not in df.columns:
-        raise ValueError("No 'close' column found in data.")
+                        # Enter SHORT
+                        eth_balance = - (cash_balance / latest_price)
+                        cash_balance = 0.0
+                        current_position = "SHORT"
 
-    for i in range(len(df)):
-        row = df.iloc[i]
-        date = row['date']
+                elif signal == "HOLD":
+                    pass
 
-        close_price = row['close']
-        features = extract_features(df.iloc[:i+1])
-        sentiment = get_sentiment_summary(features, step=i)
+                # Update wallet value in USD
+                wallet_balance = cash_balance + (eth_balance * latest_price)
 
-        action = "HOLD"
-        if "buy" in sentiment.lower():
-            action = "BUY"
-        elif "sell" in sentiment.lower():
-            action = "SELL"
+                # Display
+                display_output(
+                    signal=signal,
+                    price=latest_price,
+                    time=latest_time,
+                    initial_balance=wallet_balance,
+                    previous_price=previous_price,
+                    probabilities=probabilities
+                )
 
-        if action == "BUY" and cash > 0:
-            eth = cash / close_price
-            cash = 0
-        elif action == "SELL" and eth > 0:
-            cash = eth * close_price
-            eth = 0
+                # Save to CSV
+                with open(csv_file, "a") as f:
+                    f.write(f"{latest_time},{latest_price},{signal},"
+                            f"{probabilities.get('SELL', 0):.4f},"
+                            f"{probabilities.get('HOLD', 0):.4f},"
+                            f"{probabilities.get('BUY', 0):.4f},"
+                            f"{wallet_balance:.2f}\n")
+            else:
+                print("❌ Failed to preprocess live features.")
+        else:
+            print("❌ Failed to fetch live ETH data.")
 
-        total_value = cash + eth * close_price
-        portfolio_values.append((date, total_value, action))
-        print(f"📅 {date} | Action: {action} | ETH: {eth:.4f} | Cash: ${cash:.2f} | Portfolio Value: ${total_value:.2f}")
+        print("\n⏳ Sleeping for 5 minutes...\n")
+        time.sleep(300)
 
-    result_df = pd.DataFrame(portfolio_values, columns=["Date", "Portfolio Value", "Action"])
-    result_df.set_index("Date", inplace=True)
-    result_df["Portfolio Value"].plot(title="\U0001F4CA Portfolio Value Over Time")
-    return result_df
-
-def run_backtest_mode(source="binance"):
-    if source == "binance":
-        df = fetch_binance_candle_data()
-    elif source == "coinmarketcap":
-        df = fetch_coinmarketcap_data(api_key="cf1a3abc-4e7a-4f73-8c57-13fc66fb6a76")
-    else:
-        raise ValueError("Invalid data source. Use 'binance' or 'coinmarketcap'.")
-
-    print(f"✅ Fetched {len(df)} rows from {source}.")
-    print(f"🧾 Initial columns: {df.columns.tolist()}")
-
-    # Prepare and validate data
-    df = prepare_data(df)
-    print("✅ Columns after prepare_data:", df.columns.tolist())
-
-    if 'close' not in df.columns:
-        raise ValueError("Missing 'close' column after prepare_data(). Check your pipeline.")
-
-    # Extract features (used for any future ML-based model)
-    features = extract_features(df)
-
-    df = generate_signals(df)
-
-    print("\n📊 Plotting backtest results...")
-    plot_backtest(df)  # now also prints accuracy
-
-    print("\n💼 Running portfolio simulation with $1000 starting balance...")
-    result_df = simulate_portfolio(df)  # also includes accuracy if available
-    print(result_df.tail())
-
-
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python extended.py [sentiment|backtest] [binance|coinmarketcap]")
-        sys.exit(1)
-
-    mode = sys.argv[1].lower()
-    source = sys.argv[2].lower() if len(sys.argv) > 2 else "coinmarketcap"
-
-    if mode == 'sentiment':
-        run_sentiment_mode()
-    elif mode == 'backtest':
-        run_backtest_mode(source)
-    else:
-        print("Invalid mode. Use 'sentiment' or 'backtest'.")
+except KeyboardInterrupt:
+    print("🛑 Stopped by user.")
