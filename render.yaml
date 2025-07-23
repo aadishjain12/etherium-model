@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: eth-signal-backend
+    runtime: python
+    region: oregon  # Or choose another region like frankfurt
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python backend/extended.py
+    envVars:
+      - key: SECRET_KEY
+        value: your-secret-here
+      - key: OPENAI_API_KEY
+        value: your-openai-api-key-here
+      - key: BINANCE_API_KEY
+        value: your-binance-api-key
+      - key: BINANCE_API_SECRET
+        value: your-binance-api-secret
